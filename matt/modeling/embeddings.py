@@ -25,6 +25,7 @@ class PartlyFrozenEmbeddings(nn.Module):
 
         self.vocab_size = embeddings.num_embeddings
         self.embedding_dim = embeddings.embedding_dim
+        self.padding_idx = embeddings.padding_idx
 
         num_frozen = frozen_mask.sum().item()
         num_active = self.vocab_size - num_frozen
@@ -102,12 +103,18 @@ class PartlyFrozenEmbeddings(nn.Module):
         embeddings = nn.Embedding(
             self.vocab_size,
             self.embedding_dim,
+            padding_idx=self.padding_idx,
             device=self.frozen_embeddings.weight.device,
+            dtype=self.frozen_embeddings.weight.dtype,
         )
         
         with torch.no_grad():
-            indices = torch.arange(self.vocab_size, device=self.frozen_embeddings.weight.device)
-            embeddings.weight.data.copy_(self.forward(indices).detach().clone())
+            # Reconstruct the stored parameters directly. Subclasses may apply
+            # runtime transforms in forward(), such as Gemma's embedding scale;
+            # persisting those transformed values would apply the scale again
+            # when the exported weights are loaded back into the model.
+            embeddings.weight[self.frozen_mask] = self.frozen_embeddings.weight
+            embeddings.weight[self.active_mask] = self.active_embeddings.weight
 
         return embeddings
 
