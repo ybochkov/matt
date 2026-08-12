@@ -111,6 +111,69 @@ AIMImplType = Callable[
 ]
 
 
+def last_token_mask(word_ids: torch.Tensor) -> torch.Tensor:
+    """Return a mask for the final token of each non-special segment."""
+    if word_ids.ndim != 2:
+        raise ValueError(f"word_ids must be two-dimensional, got {tuple(word_ids.shape)}")
+
+    next_word_ids = torch.full_like(word_ids, -100)
+    next_word_ids[:, :-1] = word_ids[:, 1:]
+    return (word_ids != -100) & (word_ids != next_word_ids)
+
+
+def causal_word_pair_ids(
+    word_ids: torch.Tensor,
+    num_heads: int,
+) -> tuple[torch.Tensor, int]:
+    """Build flattened AIM pair IDs without crossing batch/head boundaries.
+
+    The returned tensor has the same flattened order as
+    ``attn_weights.unsqueeze(-1) * value_states.unsqueeze(-3)``.
+
+    Word ids restart in every sequence, so pair ids must be derived per
+    (batch row, head) slice. An earlier implementation compared neighbours
+    with ``roll()`` and numbered pairs with a global ``cumsum()`` over the
+    flattened batch: whenever the word ids touching a row boundary (or the
+    wrap-around from the last token back to the first) happened to be equal,
+    word segments from different rows or heads were merged into one pair row
+    or dropped altogether. Teacher and student AIM states are built
+    independently, so any merged or dropped row shifts every following row
+    and breaks their one-to-one correspondence in the loss. Keeping the
+    row/head structure until the very end makes such collisions impossible.
+    """
+    if word_ids.ndim != 2:
+        raise ValueError(f"word_ids must be two-dimensional, got {tuple(word_ids.shape)}")
+    if num_heads <= 0:
+        raise ValueError(f"num_heads must be positive, got {num_heads}")
+
+    device = word_ids.device
+    _, seq_len = word_ids.shape
+    repeated_word_ids = word_ids.repeat_interleave(num_heads, dim=0)
+    valid_query_mask = last_token_mask(repeated_word_ids)
+
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+    causal_word_ids = (
+        repeated_word_ids
+        .unsqueeze(-2)
+        .expand(-1, seq_len, -1)
+        .masked_fill(~causal_mask, -100)
+        .masked_fill(~valid_query_mask.unsqueeze(-1), -100)
+    )
+
+    previous_word_ids = torch.full_like(causal_word_ids, -100)
+    previous_word_ids[..., 1:] = causal_word_ids[..., :-1]
+    pair_start_mask = (causal_word_ids != -100) & (causal_word_ids != previous_word_ids)
+
+    pair_counts = pair_start_mask.sum(dim=-1)
+    flat_pair_counts = pair_counts.reshape(-1)
+    pair_offsets = (flat_pair_counts.cumsum(0) - flat_pair_counts).reshape_as(pair_counts)
+    pair_ids = pair_start_mask.cumsum(dim=-1) - 1
+    pair_ids = pair_ids + pair_offsets.unsqueeze(-1)
+    pair_ids = pair_ids.masked_fill(causal_word_ids == -100, -100)
+
+    return pair_ids.reshape(-1), int(flat_pair_counts.sum().item())
+
+
 def aim_impl(
     teacher_attn_weights: torch.Tensor,
     teacher_value_states: torch.Tensor,
@@ -163,53 +226,26 @@ def get_aim_states(
         (num_pairs, hidden_size)
     """
 
-    device = word_ids.device
-
-    batch_size, seq_len = word_ids.shape
     num_heads = attn_weights.size(1)
     hidden_size = value_states.size(-1)
 
-    # (batch_size * num_heads, seq_len) -> (batch_size * num_heads * seq_len)
-    rep_word_ids = word_ids.repeat_interleave(num_heads, dim=0)
-    rep_word_ids_flat = rep_word_ids.view(-1)
-    valid_word_mask = torch.logical_and(
-        rep_word_ids_flat != -100,  # no padding or special tokens
-        rep_word_ids_flat != rep_word_ids_flat.roll(-1),  # last token of the word
-    )
-
-    causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
-    rep_full_word_ids = (
-        # (batch_size * num_heads, seq_len)
-        rep_word_ids
-            .unsqueeze(-2)
-            # (batch_size * num_heads, seq_len, seq_len)
-            .repeat(1, seq_len, 1)
-            .masked_fill(~causal_mask, -100)
-            # (batch_size * num_heads * seq_len, seq_len)
-            .view(-1, seq_len)
-            .masked_fill(~valid_word_mask.unsqueeze(-1), -100)
-            # (batch_size * num_heads * seq_len * seq_len)
-            .view(-1)
-    )
-
-    # (batch_size * num_heads * seq_len * seq_len)
-    full_word_ids = torch.where(
-        rep_full_word_ids != -100,
-        # mask of where the words change, cumsum to get word ids across the batch
-        torch.logical_and(
-            rep_full_word_ids != -100,
-            rep_full_word_ids != rep_full_word_ids.roll(1),
-        ).cumsum(0) - 1,  # -1 because we want to start from 0
-        -100,
-    )
+    # Pair ids are assigned per (batch row, head) slice so that identical
+    # word ids in neighbouring rows or heads never share a pair row.
+    full_word_ids, num_pairs = causal_word_pair_ids(word_ids, num_heads)
     valid_word_ids_mask = full_word_ids != -100
     valid_word_ids = full_word_ids[valid_word_ids_mask]
 
     # (batch_size * num_heads * valid_rows * valid_cols, hidden_size)
     attv = attn_weights.unsqueeze(-1) * value_states.unsqueeze(-3)
-    attv = attv.view(-1, hidden_size)[valid_word_ids_mask, :]
+    attv = attv.reshape(-1, hidden_size)[valid_word_ids_mask, :]
 
-    num_pairs = valid_word_ids.max() + 1
+    if num_pairs == 0:
+        return torch.empty(
+            0,
+            hidden_size,
+            device=word_ids.device,
+            dtype=attv.dtype,
+        )
 
     # (num_pairs, hidden_size)
     attv = torch.zeros(
@@ -285,16 +321,12 @@ def get_aim_star_states(
 
     # (batch_size * num_heads, seq_len) -> (batch_size * num_heads * seq_len)
     rep_word_ids = word_ids.repeat_interleave(num_heads, dim=0)
-    rep_word_ids_flat = rep_word_ids.view(-1)
-    valid_word_mask = torch.logical_and(
-        rep_word_ids_flat != -100,  # no padding or special tokens
-        rep_word_ids_flat != rep_word_ids_flat.roll(-1),  # last token of the word
-    )
+    valid_word_mask = last_token_mask(rep_word_ids)
 
     # (batch_size * num_heads * valid_rows, hidden_size)
     word_states = (
         torch.matmul(attn_weights, value_states)
-        .view(-1, hidden_size)[valid_word_mask]
+        .reshape(-1, hidden_size)[valid_word_mask.reshape(-1)]
     )
 
     return word_states
